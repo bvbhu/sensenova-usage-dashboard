@@ -11,6 +11,7 @@ SenseNova 用量查询 - 桌面应用
 或直接双击 启动.bat
 """
 
+import base64
 import json
 import os
 import sys
@@ -22,6 +23,19 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import requests
 import webview
 import auth_login
+
+
+def _jwt_exp(token: str):
+    """从 JWT payload 解码 exp 声明（Unix 时间戳），失败返回 None。"""
+    if not token or token.count(".") < 2:
+        return None
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("exp")
+    except Exception:
+        return None
 
 # ============================================================
 # 常量
@@ -257,34 +271,43 @@ def parse_pool_data(raw):
 
 def ensure_token(account, timeout):
     """确保 account 持有可用 JWT：无 token 或即将过期时，用账号密码自动登录。
-    返回 (token, updated)，updated=True 表示 token 已刷新需写回配置。"""
+    返回 (token, updated, error)，updated=True 表示 token 已刷新需写回配置，
+    error 非 None 时表示登录失败原因（透传到界面）。"""
     token = (account.get("jwt_token") or "").strip()
-    expires_in = account.get("token_expires_in")
-    acquired = account.get("token_acquired_at")
+
+    # ---- 1) 直接解码 JWT exp 判断是否过期/即将过期 ----
     need_refresh = not token
-    if expires_in and acquired:
-        try:
-            if time.time() - float(acquired) > float(expires_in) - 300:
-                need_refresh = True
-        except (TypeError, ValueError):
-            pass
+    jwt_exp = _jwt_exp(token)
+    if jwt_exp:
+        # 提前 5 分钟刷新，避免边界 race
+        if jwt_exp - time.time() < 300:
+            need_refresh = True
+    else:
+        # 无法解码 exp（格式异常），保守地尝试刷新
+        if token:
+            need_refresh = True
+
     if not need_refresh:
-        return token, False
+        return token, False, None
+
+    # ---- 2) 用账号密码自动登录 ----
     uname = (account.get("username") or "").strip()
     pwd = (account.get("password") or "").strip()
     if not uname or not pwd:
-        return token, False
+        return token, False, "JWT 已过期且无账号密码，无法自动登录"
+
     try:
         res = auth_login.login(uname, pwd, timeout)
-    except Exception:
-        return token, False
+    except Exception as e:
+        return token, False, f"自动登录失败: {str(e)[:150]}"
+
     new_token = res.get("access_token", "")
     if not new_token:
-        return token, False
+        return token, False, "自动登录未返回 token"
     account["jwt_token"] = new_token
     account["token_acquired_at"] = time.time()
     account["token_expires_in"] = res.get("expires_in") or 10800
-    return new_token, True
+    return new_token, True, None
 
 
 def query_all_accounts():
@@ -299,9 +322,15 @@ def query_all_accounts():
 
     for account in accounts:
         name = (account.get("username") or "未知").strip()
-        token, was_updated = ensure_token(account, timeout)
+        token, was_updated, login_err = ensure_token(account, timeout)
         if was_updated:
             updated.append(account)
+
+        if login_err:
+            result["accounts"].append({
+                "username": name, "error": login_err, "items": []
+            })
+            continue
 
         if not token:
             result["accounts"].append({
@@ -330,8 +359,13 @@ def query_all_accounts():
                     items = parse_pool_data(raw)
                     result["accounts"].append({"username": name, "error": None, "items": items})
                     continue
-                except Exception:
-                    pass
+                except Exception as e2:
+                    result["accounts"].append({
+                        "username": name,
+                        "error": f"JWT 过期后自动重登失败: {str(e2)[:120]}",
+                        "items": []
+                    })
+                    continue
             if status == 401:
                 err = "JWT 已过期，请用账号密码重新登录"
             elif status == 403:
