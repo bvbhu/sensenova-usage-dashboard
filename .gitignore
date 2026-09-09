@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller
+build/
+dist/
+*.egg-info/
+
+# 敏感配置（含账号密码 / JWT，严禁提交）
+accounts.json
+
+# IDE
+.idea/
+.vscode/
+
+# WorkBuddy
+.workbuddy/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
