@@ -204,6 +204,16 @@ def ts_to_date(ts_str):
         return ""
 
 
+def _to_ts(ts_str):
+    """将时间戳字符串转为 int，无效返回 0。"""
+    if not ts_str or ts_str == "0":
+        return 0
+    try:
+        return int(ts_str)
+    except (ValueError, TypeError):
+        return 0
+
+
 def parse_pool_data(raw):
     results = []
     pools = raw.get("pools") or []
@@ -257,7 +267,9 @@ def parse_pool_data(raw):
             "remain_5h": fmt_num(remain_5h),
             "usage_pct_5h": pct_5h,
             "reset_at": ts_to_str(w5h.get("reset_at", "")),
+            "reset_at_ts": _to_ts(w5h.get("reset_at", "")),
             "reset_at_7d": ts_to_str(w7d.get("reset_at", "")),
+            "reset_at_7d_ts": _to_ts(w7d.get("reset_at", "")),
             "limit_7d": fmt_num(limit_7d),
             "used_7d": fmt_num(used_7d),
             "remain_7d": fmt_num(remain_7d),
@@ -482,6 +494,9 @@ tr:hover td { background: #fafafa; }
 .gauge .label { font-size: 10px; color: #888; margin-top: 1px; }
 .gauge-title { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
 .gauge-detail { font-size: 10px; color: #888; margin-top: 4px; line-height: 1.5; }
+.gauge-next-refresh { font-size: 10px; color: #0958d9; margin-top: 6px; line-height: 1.6; }
+.gauge-next-refresh .nr-time { font-weight: 600; }
+.gauge-next-refresh .nr-countdown { display: block; font-size: 10px; color: #888; }
 
 /* 折叠账号明细 */
 .account-collapse { background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); margin-bottom: 14px; overflow: hidden; }
@@ -559,10 +574,36 @@ function fmt(n) {
   return Math.round(n).toString();
 }
 
-function buildGauge(id, pct, usedStr, totalStr, remainStr, color, title, detail) {
+function buildGauge(id, pct, usedStr, totalStr, remainStr, color, title, detail, resetTs) {
   var r = 54;
   var c = 2 * Math.PI * r;
   var offset = c * (1 - Math.min(pct, 100) / 100);
+  var refreshHtml = '';
+  if (resetTs && resetTs > 0) {
+    var dt = new Date(resetTs * 1000);
+    var dateStr = (dt.getMonth()+1) + '月' + dt.getDate() + '日 ' +
+      (dt.getHours()<10?'0':'') + dt.getHours() + ':' +
+      (dt.getMinutes()<10?'0':'') + dt.getMinutes();
+    var now = new Date();
+    var diffMs = dt - now;
+    var countdownStr = '';
+    if (diffMs > 0) {
+      var diffMin = Math.floor(diffMs / 60000);
+      if (diffMin >= 60) {
+        var h = Math.floor(diffMin / 60);
+        var m = diffMin % 60;
+        countdownStr = h + '小时' + (m > 0 ? m + '分' : '') + '后';
+      } else {
+        countdownStr = diffMin + '分钟后';
+      }
+    } else {
+      countdownStr = '已到刷新时间';
+    }
+    refreshHtml = '<div class="gauge-next-refresh">' +
+      '<span class="nr-time">下次刷新: ' + dateStr + '</span>' +
+      '<span class="nr-countdown">（' + countdownStr + '）</span>' +
+    '</div>';
+  }
   return '<div class="gauge-wrap">' +
     '<div class="gauge-title">' + title + '</div>' +
     '<div class="gauge">' +
@@ -577,6 +618,7 @@ function buildGauge(id, pct, usedStr, totalStr, remainStr, color, title, detail)
       '</div>' +
     '</div>' +
     '<div class="gauge-detail">' + detail + '</div>' +
+    refreshHtml +
   '</div>';
 }
 
@@ -674,8 +716,8 @@ function renderData(data) {
   var total5h = 0, used5h = 0, remain5h = 0;
   var total7d = 0, used7d = 0, remain7d = 0;
   var acctCount = 0, okCount = 0, errCount = 0;
-  var earliest5hReset = '';
-  var earliest7dReset = '';
+  var earliest5hReset = 0;
+  var earliest7dReset = 0;
 
   accounts.forEach(function(a) {
     if (a.error) { errCount++; return; }
@@ -689,6 +731,11 @@ function renderData(data) {
       total7d += parseFloat(item.limit_7d.replace(/,/g,'')) || 0;
       used7d += parseFloat(item.used_7d.replace(/,/g,'')) || 0;
       remain7d += parseFloat(item.remain_7d.replace(/,/g,'')) || 0;
+      // 取所有账号中最小的 reset_at 时间戳
+      var t5 = item.reset_at_ts || 0;
+      if (t5 > 0 && (earliest5hReset === 0 || t5 < earliest5hReset)) earliest5hReset = t5;
+      var t7 = item.reset_at_7d_ts || 0;
+      if (t7 > 0 && (earliest7dReset === 0 || t7 < earliest7dReset)) earliest7dReset = t7;
     });
   });
 
@@ -697,10 +744,10 @@ function renderData(data) {
   var col5h = colorForPct(pct5h);
   var col7d = colorForPct(pct7d);
 
-  // 渲染进度球
+  // 渲染进度球（每个球下方显示自己的下次刷新时间）
   var gh = '';
-  gh += buildGauge('ring5h', pct5h, fmt(used5h), fmt(total5h), fmt(remain5h), col5h, '5小时窗口', okCount + ' 个账号合计');
-  gh += buildGauge('ring7d', pct7d, fmt(used7d), fmt(total7d), fmt(remain7d), col7d, '7天窗口', okCount + ' 个账号合计');
+  gh += buildGauge('ring5h', pct5h, fmt(used5h), fmt(total5h), fmt(remain5h), col5h, '5小时窗口', okCount + ' 个账号合计', earliest5hReset);
+  gh += buildGauge('ring7d', pct7d, fmt(used7d), fmt(total7d), fmt(remain7d), col7d, '7天窗口', okCount + ' 个账号合计', earliest7dReset);
   document.getElementById('gauges').innerHTML = gh;
 
   // 动画填充进度环
