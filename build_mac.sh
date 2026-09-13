@@ -32,23 +32,57 @@ if [ ! -f "app.icns" ]; then
 fi
 
 PYTHON=$(command -v python3 || command -v python)
-echo "使用 Python: $PYTHON"
+echo "当前 Python: $PYTHON"
 
-# 检测是否为 framework 构建（pywebview 在 macOS 上必须有 framework Python，否则运行时崩溃）
-if ! "$PYTHON" -c "import sys; p=sys.executable; assert ('framework' in p) or ('Python.framework' in p) or ('Cellar' in p) or ('opt/homebrew' in p), 'not framework'" 2>/dev/null; then
+# 检测是否为 framework 构建（pywebview 在 macOS 上必须有 framework Python，否则运行时崩溃）。
+# 用 sysconfig 的 PYTHONFRAMEWORK 配置判断，比路径字串更可靠（兼容 python.org / Homebrew / conda-forge 等所有 framework build）。
+# conda / miniforge 环境的 PYTHONFRAMEWORK 为空，不能直接用。
+if ! "$PYTHON" -c "import sysconfig; assert sysconfig.get_config_var('PYTHONFRAMEWORK'), 'PYTHONFRAMEWORK is empty'" 2>/dev/null; then
   echo "------------------------------------------------------------"
-  echo "⚠️  当前 python3 不是 framework 构建，pywebview 无法运行！"
-  echo "请改用 Homebrew 安装的 python3："
-  echo "    brew install python"
-  echo "    # 安装后重新打开终端，确认 which python3 指向 /opt/homebrew 或 /usr/local"
+  echo "⚠️  当前 Python 不是 framework 构建，pywebview 无法运行！"
+  echo "  Python: $PYTHON"
+  echo "  （conda / miniforge 环境均非 framework 构建，不适用）"
+  echo "正在寻找系统上的 framework 版 Python ..."
+
+  # 自动搜索 framework 版 Python
+  _found=""
+  for cmd in python3 python /usr/local/bin/python3 /opt/homebrew/bin/python3 \
+             /Library/Frameworks/Python.framework/Versions/3.*/bin/python3; do
+    p=$(command -v "$cmd" 2>/dev/null) || p="$cmd"
+    [ -x "$p" ] || continue
+    if "$p" -c "import sysconfig; assert sysconfig.get_config_var('PYTHONFRAMEWORK')" 2>/dev/null; then
+      _found="$p"
+      break
+    fi
+  done
+
+  if [ -n "$_found" ]; then
+    echo "找到 framework 版 Python: $_found"
+    PYTHON="$_found"
+  else
+    echo "未找到 framework 版 Python。请任选其一安装后重试："
+    echo "  1) Homebrew（推荐）: brew install python"
+    echo "  2) python.org 安装包: https://www.python.org/downloads/"
+    echo "------------------------------------------------------------"
+    exit 1
+  fi
   echo "------------------------------------------------------------"
-  exit 1
 fi
 
+echo "使用 Python: $PYTHON"
+
 echo "安装/更新依赖..."
-"$PYTHON" -m pip install --quiet --upgrade \
-  requests PyJWT tabulate pywebview pyinstaller \
+# 分两次装：先把 pyobjc 全家桶（编译重头）装完，再装剩下的轻包。
+# 拆开是为了避开 pip 25.x 在装多个 sdist 包时并发 build 的 EEXIST bug。
+"$PYTHON" -m pip install --quiet --upgrade --default-timeout=300 \
   pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-WebKit
+
+# ⚠️ cryptography 不能 --upgrade：49+ 在 macOS x86_64 + Python 3.13 framework 上没有预编译
+# wheel，pip 会尝试从源码编译（需要 Rust），大概率失败或极慢。48.x 有现成 wheel，直接用。
+# jwcrypto 同理，锁 1.5.8（兼容 cryptography 48.x）；1.6.0 会要求 cryptography>=49。
+# --upgrade-strategy only-if-needed 防止 pip 自作主张升级已有满足依赖的包。
+"$PYTHON" -m pip install --quiet --upgrade-strategy only-if-needed --default-timeout=300 \
+  requests "cryptography<49" "jwcrypto==1.5.8" pywebview pyinstaller
 
 APP="SenseNova用量查询"
 APP_BUNDLE="dist/$APP.app"
@@ -64,7 +98,9 @@ echo "开始打包（onedir + windowed → 生成 .app，图标 app.icns）..."
   --hidden-import webview.platforms.cocoa \
   --hidden-import pyobjc \
   --hidden-import requests \
-  --hidden-import jwt \
+  --hidden-import jwcrypto \
+  --hidden-import cryptography \
+  --hidden-import auth_login \
   dashboard.py
 
 echo "写入空白账号模板到 .app（不含任何真实 Token，首次运行也可在窗口内填写）..."
